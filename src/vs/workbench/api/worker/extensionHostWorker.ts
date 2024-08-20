@@ -6,8 +6,9 @@
 import { IMessagePassingProtocol } from 'vs/base/parts/ipc/common/ipc';
 import { VSBuffer } from 'vs/base/common/buffer';
 import { Emitter } from 'vs/base/common/event';
-import { isMessageOfType, MessageType, createMessageOfType, IExtensionHostInitData } from 'vs/workbench/services/extensions/common/extensionHostProtocol';
-import { ExtensionHostMain } from 'vs/workbench/api/common/extensionHostMain';
+import { isMessageOfType, MessageType, createMessageOfType } from 'vs/workbench/services/extensions/common/extensionHostProtocol';
+import { IInitData } from 'vs/workbench/api/common/extHost.protocol';
+import { ExtensionHostMain } from 'vs/workbench/services/extensions/common/extensionHostMain';
 import { IHostUtils } from 'vs/workbench/api/common/extHostExtensionService';
 import { NestedWorker } from 'vs/workbench/services/extensions/worker/polyfillNestedWorker';
 import * as path from 'vs/base/common/path';
@@ -21,7 +22,7 @@ import { URI } from 'vs/base/common/uri';
 //#region --- Define, capture, and override some globals
 
 declare function postMessage(data: any, transferables?: Transferable[]): void;
-declare const name: string; // https://developer.mozilla.org/en-US/docs/Web/API/DedicatedWorkerGlobalScope/name
+
 declare type _Fetch = typeof fetch;
 
 declare namespace self {
@@ -30,8 +31,8 @@ declare namespace self {
 	let addEventListener: any;
 	let removeEventListener: any;
 	let dispatchEvent: any;
-	let indexedDB: { open: any;[k: string]: any };
-	let caches: { open: any;[k: string]: any };
+	let indexedDB: { open: any, [k: string]: any };
+	let caches: { open: any, [k: string]: any };
 	let importScripts: any;
 	let fetch: _Fetch;
 	let XMLHttpRequest: any;
@@ -43,37 +44,26 @@ self.close = () => console.trace(`'close' has been blocked`);
 const nativePostMessage = postMessage.bind(self);
 self.postMessage = () => console.trace(`'postMessage' has been blocked`);
 
-function shouldTransformUri(uri: string): boolean {
-	// In principle, we could convert any URI, but we have concerns
-	// that parsing https URIs might end up decoding escape characters
-	// and result in an unintended transformation
-	return /^(file|vscode-remote):/i.test(uri);
-}
-
 const nativeFetch = fetch.bind(self);
-function patchFetching(asBrowserUri: (uri: URI) => Promise<URI>) {
-	self.fetch = async function (input, init) {
-		if (input instanceof Request) {
-			// Request object - massage not supported
-			return nativeFetch(input, init);
-		}
-		if (shouldTransformUri(String(input))) {
-			input = (await asBrowserUri(URI.parse(String(input)))).toString(true);
-		}
+self.fetch = function (input, init) {
+	if (input instanceof Request) {
+		// Request object - massage not supported
 		return nativeFetch(input, init);
-	};
+	}
+	if (/^file:/i.test(String(input))) {
+		input = FileAccess.asBrowserUri(URI.parse(String(input))).toString(true);
+	}
+	return nativeFetch(input, init);
+};
 
-	self.XMLHttpRequest = class extends XMLHttpRequest {
-		override open(method: string, url: string | URL, async?: boolean, username?: string | null, password?: string | null): void {
-			(async () => {
-				if (shouldTransformUri(url.toString())) {
-					url = (await asBrowserUri(URI.parse(url.toString()))).toString(true);
-				}
-				super.open(method, url, async ?? true, username, password);
-			})();
+self.XMLHttpRequest = class extends XMLHttpRequest {
+	override open(method: string, url: string | URL, async?: boolean, username?: string | null, password?: string | null): void {
+		if (/^file:/i.test(url.toString())) {
+			url = FileAccess.asBrowserUri(URI.parse(url.toString())).toString(true);
 		}
-	};
-}
+		return super.open(method, url, async ?? true, username, password);
+	}
+};
 
 self.importScripts = () => { throw new Error(`'importScripts' has been blocked`); };
 
@@ -90,57 +80,25 @@ self.addEventListener = () => console.trace(`'addEventListener' has been blocked
 (<any>self)['webkitResolveLocalFileSystemURL'] = undefined;
 
 if ((<any>self).Worker) {
+	const ttPolicy = (<any>self).trustedTypes?.createPolicy('extensionHostWorker', { createScriptURL: (value: string) => value });
 
 	// make sure new Worker(...) always uses blob: (to maintain current origin)
 	const _Worker = (<any>self).Worker;
 	Worker = <any>function (stringUrl: string | URL, options?: WorkerOptions) {
 		if (/^file:/i.test(stringUrl.toString())) {
-			stringUrl = FileAccess.uriToBrowserUri(URI.parse(stringUrl.toString())).toString(true);
-		} else if (/^vscode-remote:/i.test(stringUrl.toString())) {
-			// Supporting transformation of vscode-remote URIs requires an async call to the main thread,
-			// but we cannot do this call from within the embedded Worker, and the only way out would be
-			// to use templating instead of a function in the web api (`resourceUriProvider`)
-			throw new Error(`Creating workers from remote extensions is currently not supported.`);
+			stringUrl = FileAccess.asBrowserUri(URI.parse(stringUrl.toString())).toString(true);
 		}
-
-		// IMPORTANT: bootstrapFn is stringified and injected as worker blob-url. Because of that it CANNOT
-		// have dependencies on other functions or variables. Only constant values are supported. Due to
-		// that logic of FileAccess.asBrowserUri had to be copied, see `asWorkerBrowserUrl` (below).
-		const bootstrapFnSource = (function bootstrapFn(workerUrl: string) {
-			function asWorkerBrowserUrl(url: string | URL | TrustedScriptURL): any {
-				if (typeof url === 'string' || url instanceof URL) {
-					return String(url).replace(/^file:\/\//i, 'vscode-file://vscode-app');
-				}
-				return url;
-			}
-
-			const nativeFetch = fetch.bind(self);
-			self.fetch = function (input, init) {
-				if (input instanceof Request) {
-					// Request object - massage not supported
-					return nativeFetch(input, init);
-				}
-				return nativeFetch(asWorkerBrowserUrl(input), init);
-			};
-			self.XMLHttpRequest = class extends XMLHttpRequest {
-				override open(method: string, url: string | URL, async?: boolean, username?: string | null, password?: string | null): void {
-					return super.open(method, asWorkerBrowserUrl(url), async ?? true, username, password);
-				}
-			};
-			const nativeImportScripts = importScripts.bind(self);
-			self.importScripts = (...urls: string[]) => {
-				nativeImportScripts(...urls.map(asWorkerBrowserUrl));
-			};
-
-			nativeImportScripts(workerUrl);
-		}).toString();
-
-		const js = `(${bootstrapFnSource}('${stringUrl}'))`;
+		const js = `(function() {
+	const ttPolicy = self.trustedTypes ? self.trustedTypes.createPolicy('extensionHostWorker', { createScriptURL: (value) => value }) : undefined;
+	const stringUrl = '${stringUrl}';
+	importScripts(ttPolicy ? ttPolicy.createScriptURL(stringUrl) : stringUrl);
+})();
+`;
 		options = options || {};
-		options.name = `${name} -> ${options.name || path.basename(stringUrl.toString())}`;
+		options.name = options.name || path.basename(stringUrl.toString());
 		const blob = new Blob([js], { type: 'application/javascript' });
 		const blobUrl = URL.createObjectURL(blob);
-		return new _Worker(blobUrl, options);
+		return new _Worker(ttPolicy ? ttPolicy.createScriptURL(blobUrl) : blobUrl, options);
 	};
 
 } else {
@@ -155,9 +113,14 @@ if ((<any>self).Worker) {
 
 const hostUtil = new class implements IHostUtils {
 	declare readonly _serviceBrand: undefined;
-	public readonly pid = undefined;
 	exit(_code?: number | undefined): void {
 		nativeClose();
+	}
+	async exists(_path: string): Promise<boolean> {
+		return true;
+	}
+	async realpath(path: string): Promise<string> {
+		return path;
 	}
 };
 
@@ -209,13 +172,13 @@ class ExtensionWorker {
 
 interface IRendererConnection {
 	protocol: IMessagePassingProtocol;
-	initData: IExtensionHostInitData;
+	initData: IInitData;
 }
 function connectToRenderer(protocol: IMessagePassingProtocol): Promise<IRendererConnection> {
 	return new Promise<IRendererConnection>(resolve => {
 		const once = protocol.onMessage(raw => {
 			once.dispose();
-			const initData = <IExtensionHostInitData>JSON.parse(raw.toString());
+			const initData = <IInitData>JSON.parse(raw.toString());
 			protocol.send(createMessageOfType(MessageType.Initialized));
 			resolve({ protocol, initData });
 		});
@@ -225,39 +188,18 @@ function connectToRenderer(protocol: IMessagePassingProtocol): Promise<IRenderer
 
 let onTerminate = (reason: string) => nativeClose();
 
-interface IInitMessage {
-	readonly type: 'vscode.init';
-	readonly data: ReadonlyMap<string, MessagePort>;
-}
-
-function isInitMessage(a: any): a is IInitMessage {
-	return !!a && typeof a === 'object' && a.type === 'vscode.init' && a.data instanceof Map;
-}
-
-export function create(): { onmessage: (message: any) => void } {
-	performance.mark(`code/extHost/willConnectToRenderer`);
+export function create(): void {
 	const res = new ExtensionWorker();
+	performance.mark(`code/extHost/willConnectToRenderer`);
+	connectToRenderer(res.protocol).then(data => {
+		performance.mark(`code/extHost/didWaitForInitData`);
+		const extHostMain = new ExtensionHostMain(
+			data.protocol,
+			data.initData,
+			hostUtil,
+			null,
+		);
 
-	return {
-		onmessage(message: any) {
-			if (!isInitMessage(message)) {
-				return; // silently ignore foreign messages
-			}
-
-			connectToRenderer(res.protocol).then(data => {
-				performance.mark(`code/extHost/didWaitForInitData`);
-				const extHostMain = new ExtensionHostMain(
-					data.protocol,
-					data.initData,
-					hostUtil,
-					null,
-					message.data
-				);
-
-				patchFetching(uri => extHostMain.asBrowserUri(uri));
-
-				onTerminate = (reason: string) => extHostMain.terminate(reason);
-			});
-		}
-	};
+		onTerminate = (reason: string) => extHostMain.terminate(reason);
+	});
 }
